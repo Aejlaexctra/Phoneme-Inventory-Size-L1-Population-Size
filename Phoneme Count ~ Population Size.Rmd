@@ -1,0 +1,557 @@
+---
+title: "Phoneme Count ~ Population Size"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+  html_notebook: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(ellipse)
+library(ggplot2)
+library(ivreg)
+library(nloptr)
+library(dplyr)
+library(crayon)
+library(tidyr)
+```
+
+**Get phylogenetic, spatial and bordering matrices**
+
+```{r}
+
+```
+
+**Retrieve language data**
+
+```{r}
+
+# Choose between: ER, AA, EA, RA, PHOIBLE, SAPHON, UPSID, LAPSYD
+
+database = "PHOIBLE"
+data <- read.csv(gsub(" ", "", paste("Code/Output/", database,"-data_UPDATED.csv")))
+
+# Retrieve columns from data and filter
+data$"L1_pop"[!grepl("^\\d+$", data$"L1_pop")] <- NA # Replace non-numeric values with NA
+# Make sure that columns are treated as numeric, not categories
+data$"L1_pop" <- as.numeric(data$"L1_pop")
+data$"Sounds" <- as.numeric(data$"Sounds")
+data <- data[data$Macroarea != "None", ] # Get rid of "None" value from Macroareas, applies to osse1243
+data <- na.omit(data) # Removes NA value containing rows
+
+#Checking for duplicates, as some ISOCODES can represent multiple unique glottocodes
+dup_group = data$ISO639P3
+duplicates <- data[duplicated(dup_group) | duplicated(dup_group, fromLast = TRUE), ]
+print("Duplicate ISOCODES")
+print(duplicates)
+
+data <- data[!duplicated(data$ISO639P3), ] # Remove duplicate rows based on the 'ISO639P3' column
+data <- data[order(data$ISO639P3), ] # Sort entries based on alphabetical order in ISO column
+
+# Preview data
+# summary(data)
+# head(data)
+
+# Reshaping Wsp, Wphy and Wnb to match data
+reshape_matrix <- function(matrix, col){
+  matrix <- matrix[, colnames(matrix) %in% col]
+  matrix <- matrix[rownames(matrix) %in% col,] 
+  return(matrix)
+}
+
+Wsp <- reshape_matrix(Wsp, data$ISO639P3)
+Wphy <- reshape_matrix(Wphy, data$ISO639P3)
+Wnb <- reshape_matrix(Wnb, data$ISO639P3)
+
+print(dim(data)) # get number of languages currently used
+```
+
+**Repeated random sampling to test how representative our reduced PHOIBLE set is of the languages contained within Glottolog database by region:**
+
+```{r}
+# Fetch Glottocode data
+glotto_data <- read.csv("Data/languages_and_dialects_geo.csv")
+glotto_data <- glotto_data[glotto_data$level != "dialect", ] # Remove dialects
+glotto_macroareas <- glotto_data$macroarea # Get macroareas column
+glotto_macroareas <- glotto_macroareas[glotto_macroareas != ""] # remove NA regions
+
+# Find number of languages in each region for Phoible
+macroarea_names = c("Africa", "Papunesia", "Australia", "Eurasia", "North America", "South America")
+rough_macroarea_names = c("Africa", "Papunesi", "Australi", "Eurasia", "North Am", "South Am") # adjusted for updated database shortenings
+phoible_macroareas <- data$Macroarea
+
+phoible_macroarea_num = numeric() # Number of languages in each region
+for(macroarea_name in rough_macroarea_names){
+  phoible_macroarea_num <- c(phoible_macroarea_num,
+                             length(phoible_macroareas[phoible_macroareas == macroarea_name]))
+}
+
+# Bind columns together
+phoible_macroareas_sum = data.frame(macroarea_names,phoible_macroarea_num)
+
+# Repeated a 1000 times, randomly sample without replacement 
+test_data <- data.frame(matrix(ncol = length(macroarea_names), nrow = 0)) # set up empty dataframe
+colnames(test_data) <- macroarea_names # Set column names
+for(i in 0:999){
+  test_tally = list("Africa" = 0,
+                       "Papunesia" = 0,
+                       "Australia" = 0,
+                       "Eurasia" = 0,
+                       "North America" = 0,
+                       "South America" = 0) # Tally of how many languages are in each region.
+  
+  sampled_data <- sample(glotto_macroareas, size = length(phoible_macroareas), replace = FALSE)
+  
+  for(sample_lang in sampled_data){
+    test_tally[[sample_lang]] = test_tally[[sample_lang]] + 1
+  }
+  test_tally <- unlist(test_tally)
+  #names(test_tally) <- NULL
+  test_data <- rbind(test_data, test_tally)
+  #return(test_data)
+}
+
+colnames(test_data) <- macroarea_names
+# Reshape the dataframe to long format
+test_data_long <- pivot_longer(test_data, everything(), names_to = c("Group"), values_to = 'Value')
+
+# Create a boxplot
+glotto_box <- ggplot(test_data_long, aes(x = Group, y = Value)) +
+  geom_boxplot(varwidth = TRUE) +
+  geom_point(data = phoible_macroareas_sum, 
+             aes(x = macroarea_names, y = phoible_macroarea_num), 
+             color = "red",
+             size = 4) + 
+  ylab("# Number of Languages") +
+  xlab("Macro-Area")
+  # + ggtitle("Phoible Compared to 1000 Random Samples of Glottolog for Macro-Areas")
+
+# Save graph
+ggsave(plot = glotto_box, filename = gsub(" ", "", paste("Code/Output/", database, "_RandomSampleComparison.pdf")), scale = 0.3)
+
+print(glotto_box)
+```
+
+782 languages, the number of languages in our Phoible dataset, are randomly sampled with replacement from Glottolog 1000 times in black, and we see how it compares to our Phoible datapoints in red. Based on the boxplot, Africa is over-represented, while the other regions are below average to some degree, the worst being Eurasia and Papunesia.
+
+**Plotting initial data. Phoneme count as dependent variable, L1 population size as independent variable:**
+
+```{r}
+# Set group type
+group = data$Macroarea
+
+epsilon = 1e-3 # to prevent infinite log values
+
+# Plot data
+graph = ggplot(data, aes(x = L1_pop + epsilon, y = Sounds, color = group)) + 
+  geom_point() + 
+  stat_ellipse(geom = "polygon", alpha = 0.2, aes(fill = group)) + 
+  labs(x = "Population Size", y = "Phoneme Count", color = "Macro-area") + # title = "Phoneme Count ~ L1 Population Size Scatterplot",  
+  theme_minimal() +
+  # theme(legend.position = "none") + # Hide the legend for now, often too many groups
+  xlim(min(data$L1_pop),max(data$L1_pop)) + 
+  ylim(min(data$Sounds), max(data$Sounds)) +
+  scale_y_continuous(trans = 'log10') +
+  scale_x_continuous(trans = 'log10')
+
+# # Plot data for nonlinear fit
+# graph = ggplot(data, aes(x = L1_pop + epsilon, y = Sounds)) + 
+#   geom_point() + 
+#   geom_smooth() + 
+#   # stat_ellipse(geom = "polygon", alpha = 0.2, aes(fill = group)) + 
+#   labs(x = "Population Size", y = "Phoneme Count") + # color = "Macro-area") + # title = "Phoneme Count ~ L1 Population Size Scatterplot",  
+#   theme_minimal() +
+#   # theme(legend.position = "none") + # Hide the legend for now, often too many groups
+#   xlim(min(data$L1_pop),max(data$L1_pop)) + 
+#   ylim(min(data$Sounds), max(data$Sounds)) +
+#   scale_y_continuous(trans = 'log10') +
+#   scale_x_continuous(trans = 'log10')
+
+# Save graph
+ggsave(plot = graph, filename = gsub(" ", "", paste("Code/Output/", database, "_PopVPhoneme.pdf")), scale = 0.3)
+
+# Show graph
+print(graph)
+```
+
+```{r}
+# Plot data for linear fit
+graph = ggplot(data, aes(x = L1_pop + epsilon, y = Sounds)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  labs(x = "Population Size", y = "Phoneme Count") + 
+  theme_minimal() +
+  xlim(min(data$L1_pop),max(data$L1_pop)) +
+  ylim(min(data$Sounds), max(data$Sounds)) +
+  scale_y_continuous(trans = 'log10') +
+  scale_x_continuous(trans = 'log10')
+
+# Save graph
+ggsave(plot = graph, filename = gsub(" ", "", paste("Code/Output/", database, "_NonLin_PopVPhoneme.pdf")), scale = 0.3)
+
+# Show graph
+print(graph)
+```
+
+```{r}
+# Get clustering in Africa
+is_Africa <- function(x) {
+  if(x == "Africa"){
+    return(1)
+  } else {
+    return(0)
+  }
+}
+
+data <- data %>% 
+  mutate(is_Africa = sapply(Macroarea, is_Africa))
+
+# Define colors for each group
+colours <- c("1" = "red", "0" = "black")
+
+# Plot data
+graph = ggplot(data, aes(x = L1_pop + epsilon, y = Sounds, color = as.factor(data$is_Africa))) + 
+  geom_point() + 
+  labs(x = "Population Size", y = "Phoneme Count") +
+  theme_minimal() +
+  scale_color_manual(values = colours) + 
+  theme(legend.position = "none") + # Hide the legend for now, often too many groups
+  xlim(min(data$L1_pop),max(data$L1_pop)) + 
+  ylim(min(data$Sounds), max(data$Sounds)) +
+  scale_y_continuous(trans = 'log10') +
+  scale_x_continuous(trans = 'log10')
+
+# Save graph
+ggsave(plot = graph, filename = gsub(" ", "", paste("Code/Output/", database, "_PopVPhoneme_Africa.pdf")), scale = 0.3)
+
+# Show graph
+print(graph)
+
+```
+
+**Seeing Spearman correlations without accounting for phylospatial autocorrelation:**
+
+```{r}
+category_names <- c("Sounds", "Consonants", "Vowels")
+categories <- list(data$Sounds, data$Consonants, data$Vowels)
+
+# Iterate over the list, print the name and the values of each category
+for (i in seq_along(categories)) {
+  cat(bold("Category:"), bold(category_names[i]), "\n")
+  
+  # Calculate correlation coefficients
+  spearman_correlation_coefficient <- cor(data$L1_pop, categories[[i]], method = "spearman")
+  spearman_test <- cor.test(data$L1_pop, categories[[i]], method = "spearman")
+  p_value <- spearman_test$p.value
+  
+  # Print the results
+  print(paste("Spearman's coefficient: ",spearman_correlation_coefficient)) 
+  print(paste("p-value: ", p_value)) 
+  
+  cat("\n")
+}
+
+```
+
+**Seeing if there is a linear correlation without correction:**
+
+```{r}
+#a is the matrices coefficients --- Notes by Xia
+#y is the response vector
+#X is the predictors' matrix
+#Wsp, Wphy, Wnb are the autocorrelative matrices
+
+X <- data$L1_pop
+X <- scale(X) # Standardize X, make results clearer as one standard deviation effect.
+y <- data$Sounds
+
+lm = lm(y ~ X)
+summary(lm)
+```
+
+Not a statistically significant result.
+
+**Now, accounting for autocorrelation, is there any significant effect?**
+
+```{r}
+
+fml <- formula('data$Sounds ~ scale(data$L1_pop) + res + weighted_sums')
+
+autoglm <- function (a, y, X, Wsp, Wphy, fml, step) {
+  # W <- a[2]*(a[1]*Wsp+(1-a[1])*Wnb)+(1-a[2])*Wphy
+  W <- a*Wsp+(1-a)*Wphy
+  Wy <- W %*% y  # calculates a weighted sum of y using W
+  X2 <- W %*% X  # calculates a weighted sum of X using W
+  X2 <- cbind(X, X2)  # concatenates X and X2 as columns in a new matrix
+  res <- lm(Wy~X2)$residuals  # fits a linear model of Wy on X2 and extracts the residuals
+  X1 <- cbind(y,Wy, X, res)  # concatenates Wy, X, and the residuals as columns in a new matrix
+  colnames(X1)[1:2] <- c(as.character(fml)[2], 'weighted_sums')
+  
+  if(step == 1){
+    out2 <- glm(formula = fml, data = as.data.frame(X1), family = gaussian())
+    # summary(out2)
+    #-out$loglik  # returns the negative log-likelihood of the model
+    out2 <- -logLik(out2)[[1]]
+  } else if(step == 2){
+    out2 <- glm(formula = fml, data = as.data.frame(X1), family=gaussian())
+  } else {
+    out2 <- glm(formula = fml, data = as.data.frame(X1), family=gaussian())
+    out2 <- BIC(out2)
+  }
+  return(out2)
+}
+
+best_a <- try(optim((1), autoglm, method="Brent", lower=c(0), upper=c(1), y=y, X=X, Wsp=Wsp, Wphy=Wphy, fml = fml, step = 1))
+
+cat("Best a weighting: ",best_a$par,"\n")
+print("If a < 0.5, then phylogenetic relationship prioritised, else spatial relationships valued")
+
+model <- autoglm(a = best_a$par, y=y, X=X, Wsp=Wsp, Wphy=Wphy, fml = fml, step = 2)
+
+print(summary(model))
+```
+
+**Testing now across separate macro-areas, using log10 transform of L1_pop first without any weighting update for visualisation:**
+
+```{r}
+
+if(database == "RA"){
+  data <- data[data$ISO639P3 != "bwo",] # remove entry as not included in weighting matrix
+}
+
+macroarea_names <- unique(data$Macroarea)
+macroareas <- list()
+
+for (macroarea_name in macroarea_names) {
+    macroarea_data <- data[data$Macroarea == macroarea_name, ] # Get only rows of specified macroarea
+    macroareas[[macroarea_name]] <- macroarea_data
+}
+
+for (macroarea_name in macroarea_names) {
+  
+  # Scaled results to log10
+  X <- macroareas[[macroarea_name]]$L1_pop
+  epsilon <- 0.01 # Account for infinite values when taking log
+  log_X <- log10(X+epsilon) 
+  y <- macroareas[[macroarea_name]]$Sounds
+  log_y <- log10(y)
+  
+  basic_model <- lm(log_y ~ log_X)
+  intercept = basic_model$coefficients[[1]]
+  slope = basic_model$coefficients[[2]]
+  
+  # Plot data
+  graph = ggplot(macroareas[[macroarea_name]], aes(x = log_X, y = log_y)) + 
+    geom_point() + 
+    geom_abline(slope = slope, intercept = intercept, color = "red") + 
+    annotate("text", x = max(log_X) - 0.5, y = max(log_y), label = paste("Slope:", round(slope, 4), hjust = 1, vjust = 1)) + # Annotate slope
+    labs(title = macroarea_name, x = "log10 L1 Population Size", y = "log10 Phoneme Count") +
+    theme_minimal() +
+    xlim(min(log_X),max(log_X)) + 
+    ylim(min(log_y), max(log_y))
+ 
+  # Save graph
+  ggsave(plot = graph, filename = 
+gsub(" ", "", paste("Code/Output/Region_No_Correction/", database, "_", macroarea_name, "_PopVPhoneme.pdf")), scale = 0.3)
+  
+ # print(graph) # causes session to abort
+}
+```
+
+**Now accounting for autocorrelation across macroareas:**
+
+```{r}
+for (macroarea_name in macroarea_names) {
+  cat(bold("Macroarea:"), bold(macroarea_name), "\n")
+  
+  Wsp_m <- reshape_matrix(Wsp, macroareas[[macroarea_name]]$ISO639P3)
+  Wphy_m <- reshape_matrix(Wphy, macroareas[[macroarea_name]]$ISO639P3)
+  
+  # Scaled results to standard distribution
+  
+  X <- macroareas[[macroarea_name]]$L1_pop
+  X <- scale(X) # Standardize X, make results clearer as one standard deviation effect.
+  y <- macroareas[[macroarea_name]]$Sounds
+  
+  fml <- as.formula(paste0("macroareas[['", macroarea_name, "']]$Sounds ~ scale(macroareas[['", macroarea_name, "']]$L1_pop) + res + weighted_sums"))
+  
+  best_a <- try(optim((1), autoglm, method="Brent", lower=c(0), upper=c(1), y=y, X=X, Wsp=Wsp_m, Wphy=Wphy_m, fml = fml, step = 1))
+
+  cat("Best a weighting: ",best_a$par,"\n")
+  print("If a < 0.5, then phylogenetic relationship prioritised, else spatial relationships valued")
+  
+  area_model <- autoglm(a = best_a$par, y=y, X=X, Wsp=Wsp_m, Wphy=Wphy_m, fml = fml, step = 2)
+
+  print(summary(area_model))
+  
+  cat("\n")
+}
+```
+
+**Adding Language Contact and Population Density Predictors**
+
+```{r}
+endangerment_data <- read.csv("Data/EndangeredData.csv") # Get endangerment data 
+
+endangerment_data$L1_pop_prop <- as.numeric(endangerment_data$L1_pop_prop) # Ensure numeric
+endangerment_data$bordering_language_evenness <- as.numeric(endangerment_data$bordering_language_evenness)
+endangerment_data$pop_density <- as.numeric(endangerment_data$pop_density)
+
+for (i in seq_along(endangerment_data)) {
+  if (is.numeric(endangerment_data[[i]])) {
+    endangerment_data[[i]][is.infinite(endangerment_data[[i]])] <- NA  # Replace infinite values with NA
+  }
+}
+
+
+endangerment_data <- na.omit(endangerment_data) # remove NA-containing rows
+
+endangerment_data <- endangerment_data[endangerment_data$ISO %in% data$ISO639P3,] # filter out languages not included in Phoible data
+data <- data[data$ISO639P3 %in% endangerment_data$ISO,] # and vice-versa filter out languages not included in endangerment data
+
+endangerment_data <- endangerment_data[order(endangerment_data$ISO), ] # Sort entries based on alphabetical order in ISO column
+data <- data[order(data$ISO639P3), ]
+
+# Check if datasets are equal in length
+if(dim(endangerment_data)[1] == dim(data)[1]){
+  print("Same amount of entries, and matching")
+}
+
+# Adjusting weighting matrices
+Wsp <- reshape_matrix(Wsp, data$ISO639P3)
+Wphy <- reshape_matrix(Wphy, data$ISO639P3)
+
+# Update predictors matrix
+X <- data.frame(
+  scale(data$L1_pop),
+  scale(endangerment_data$area),
+  endangerment_data$island,
+  endangerment_data$L1_pop_prop,
+  endangerment_data$bordering_language_richness,
+  endangerment_data$bordering_language_richness_perkm,
+  endangerment_data$bordering_language_evenness,
+  endangerment_data$language_richness,
+  endangerment_data$language_evenness,
+  scale(endangerment_data$pop_density)
+)
+
+X <- as.matrix(X)
+
+print(dim(data)) # get number of languages currently used
+```
+
+**Setup Model Selection Process**
+
+```{r}
+X0 <- data$L1_pop
+X0 <- scale(X0) # Standardize X, make results clearer as one standard deviation effect.
+y <- data$Sounds
+
+# Get optimal a again 
+fml <- formula('data$Sounds ~ scale(data$L1_pop) + res + weighted_sums') 
+best_a <- try(optim((1), autoglm, method="Brent", lower=c(0), upper=c(1), y=y, X=X0, Wsp=Wsp, Wphy=Wphy, fml = fml, step = 1))
+
+# Update formula to include all variable
+fml <- formula('data$Sounds ~ scale(data$L1_pop) + scale(endangerment_data$area) + endangerment_data$island + endangerment_data$L1_pop_prop + endangerment_data$bordering_language_richness + endangerment_data$bordering_language_richness_perkm + endangerment_data$bordering_language_evenness + endangerment_data$language_richness + endangerment_data$language_evenness + scale(endangerment_data$pop_density) + res + weighted_sums') 
+
+autoglm_handler <- function(fml) {autoglm(a = best_a$par, y=y, X=X, Wsp=Wsp, Wphy=Wphy, fml = fml, step = 3)}
+#summary(autoglm_handler(fml))
+
+#now we can make our list of models
+all_vars <- unlist(strsplit(as.character(fml)[[3]], '+ '))
+all_vars <- all_vars[which(all_vars != "+")]
+#all_vars <- all_vars[-c(15:16)]
+all_vars <- all_vars[-c(which(all_vars == 'res' | all_vars ==  'weighted_sums'))]
+seq <- 1:length(all_vars)
+combs <- lapply(seq, function(x) combn(all_vars, x))
+
+model_combos <- lapply(combs, function(x) as.list(as.data.frame(x)))
+model_combos <- Reduce(c, model_combos)
+names(model_combos) <- NULL
+
+for(i in 1:length(model_combos)) {
+  model_combos[[i]] <- paste0('data$Sounds ~ ', paste0(c(model_combos[[i]]), collapse = ' + ' ),'+ weighted_sums + res')
+  model_combos[[i]] <- formula(model_combos[[i]])
+  
+}
+model_combos[[length(model_combos) + 1]] <- formula('data$Sounds ~ 1')
+```
+
+**Get Model Fits**
+
+```{r}
+require(pbmcapply)
+BICs <- pbmclapply(model_combos, autoglm_handler, mc.cores = 3)
+save(BICs, file = 'BIC_PC_Phoible.Rdata')
+# save(model_combos, file = gsub(" ", "", paste("Code/Output/", database, "_model_combos.Rdata")))
+
+model_combos <- model_combos[order(unlist(BICs), decreasing = F)]
+
+BICs <- unlist(BICs)[order(unlist(BICs), decreasing = F)]
+
+compute_bic_weights <- function(bic_values) {
+  delta_bic <- bic_values - min(bic_values)
+  weights <- exp(-0.5 * delta_bic) / sum(exp(-0.5 * delta_bic))
+  return(list(delta_bic, weights))
+}
+
+bic_weights <- (compute_bic_weights(BICs))
+
+require(dplyr)
+model_summaries <- tibble(BIC = BICs, delta = bic_weights[[1]], weights = bic_weights[[2]])
+model_matrix <- matrix(ncol = length(all_vars), nrow = 0)
+colnames(model_matrix) <- all_vars
+
+
+for(i in 1:length(model_combos)){
+  model_matrix <- rbind(model_matrix, colnames(model_matrix) %in% 
+                          Reduce(c, strsplit(as.character(model_combos[[i]])[[3]], ' '))
+  )
+  print(i)
+}
+
+row_sums <- rowSums(model_matrix)
+
+model_matrix <- data.frame(apply(model_matrix, 2,function(x) ifelse(x, "X", " ")))
+model_matrix <- as_tibble(model_matrix)
+model_summaries <- bind_cols(model_summaries, model_matrix,)
+model_summaries$model_id <- 1:nrow(model_summaries)
+model_summaries$Nparam <- row_sums
+
+model_summaries <- arrange(model_summaries, BIC)
+# write.csv(model_summaries, gsub(" ", "", paste("Code/Output/", database, "_model_summaries.csv")))
+
+
+#lets make our best fitting model tables 
+model_summaries <- model_summaries[which(model_summaries$delta <= 6),]
+
+model_combos <- model_combos[which(model_summaries$delta <= 6)]
+
+fitted_models <- lapply(model_combos, function(x) autoglm(a = best_a$par, y=y, X=X, Wsp=Wsp, Wphy=Wphy, fml = x, step = 2))
+# save(file = 'Code/Output/phoible_best_fitting_models.Rdata', fitted_models)
+save(file = gsub(" ", "", paste("Code/Output/", database, "_best_fitting_models.Rdata")), fitted_models)
+
+# Get coefficients printed and saved to text file
+sink(gsub(" ", "", paste("Code/Output/", database, "_model_coefficients.txt")))
+for(model in fitted_models){
+  print(summary(model))
+}
+sink() # close connection
+
+model_coefficients <- lapply(fitted_models, coef)
+
+model_confint <- lapply(fitted_models, confint)
+
+summaries <- lapply(fitted_models, summary)
+summaries[[1]]$coefficients[which(rownames(summaries[[1]]$coefficients) %in%  colnames(model_summaries)),4]
+
+model_summaries <- as.data.frame(model_summaries)
+write.csv(model_summaries, gsub(" ", "", paste("Code/Output/", database, "_model_summaries.csv")))
+
+print(head(model_summaries))
+```

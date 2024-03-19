@@ -1,0 +1,89 @@
+---
+title: "Phoneme Centroids"
+output:
+  html_document: default
+  pdf_document: default
+date: "2024-02-05"
+---
+
+Setup packages
+
+```{r}
+library(ggplot2)
+library(dplyr)
+```
+
+Collect and clean up data
+
+```{r}
+# Retrieve data
+setwd("")
+database = "PHOIBLE"
+data <- read.csv(gsub(" ", "", paste("Output/", database,"-data_UPDATED.csv")))
+
+# Retrieve columns from data and filter
+data$"L1_pop"[!grepl("^\\d+$", data$"L1_pop")] <- NA # Replace non-numeric values with NA
+# Make sure that columns are treated as numeric, not categories
+data$"L1_pop" <- as.numeric(data$"L1_pop")
+data$"Sounds" <- as.numeric(data$"Sounds")
+data <- na.omit(data) # Removes NA value containing rows
+```
+
+Get centroids of each language family
+
+```{r}
+centroids <- data %>%
+  group_by(Family) %>%
+  summarize(
+    Sounds = mean(Sounds),
+    Consonants = mean(Consonants),
+    Vowels = mean(Vowels),
+    L1_pop = mean(L1_pop)
+  )
+
+centroids
+```
+
+Graph centroids onto scatter plot for Sounds \~ L1_pop
+
+```{r}
+
+# Set group type
+group = centroids$Family
+
+graph = ggplot(centroids, aes(y = L1_pop, x = Sounds, color = group)) + 
+  geom_point() + 
+  labs(title = "Mean Family Phoneme Count ~ Population Size Scatterplot",  
+       y = "Population Size", x = "Phoneme Count", color = "Group") +
+  theme(legend.position = "none") + # Hide the legend for now, often too many groups
+  scale_y_continuous(trans = 'log10') +
+  scale_x_continuous(trans = 'log10')
+
+graph
+```
+
+Get coreelation for centroids data
+
+```{r}
+
+category_names <- c("Sounds", "Consonants", "Vowels")
+categories <- list(centroids$Sounds, centroids$Consonants, centroids$Vowels)
+
+# Iterate over the list, print the name and the values of each category
+for (i in seq_along(categories)) {
+  cat("Category:", category_names[i], "\n")
+  
+  # Calculate correlation coefficient
+  spearman_correlation_coefficient <- cor(centroids$L1_pop, categories[[i]], method = "spearman")
+  spearman_test <- cor.test(centroids$L1_pop, categories[[i]], method = "spearman")
+  p_value <- spearman_test$p.value
+  
+  # Print the results
+  print(paste("Spearman's coefficient: ",spearman_correlation_coefficient)) 
+  print(paste("p-value: ", p_value)) 
+  cat("\n")
+}
+
+```
+
+Coefficient results greater than 0.2 for Phoible implies statistically significant result (ignoring autocorrelation).

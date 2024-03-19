@@ -1,0 +1,68 @@
+---
+title: "Mapping Phoneme Count"
+output: html_document
+date: "2024-02-05"
+---
+
+```{r}
+library(ggplot2)
+library(maps)
+library(scales)
+library(viridis)
+```
+
+```{r}
+# Retrieve data
+
+database = "PHOIBLE"
+data <- read.csv(gsub(" ", "", paste("Output/", database,"-data_UPDATED.csv")))
+# Retrieve columns from data and filter
+data$"L1_pop"[!grepl("^\\d+$", data$"L1_pop")] <- NA # Replace non-numeric values with NA
+# Make sure that columns are treated as numeric, not categories
+data$"L1_pop" <- as.numeric(data$"L1_pop")
+data$"Sounds" <- as.numeric(data$"Sounds")
+data <- na.omit(data) # Removes NA value containing rows
+
+# Download world map data
+world_map <- map_data("world") #[map_data('world')$region == "Australia",]
+
+# Subset world map data
+australia_map <- subset(world_map, region %in% c("Australia")) # For ER
+india_map <- subset(world_map, region %in% c("India")) # For RA
+africa_map <- subset(world_map, region %in% c("Africa")) # For AA
+SA_map <- subset(world_map, region %in% c("South America")) # For SAPHON
+
+# Choose map to use
+map <- world_map
+
+# Apply a log transformation to the Sounds variable
+data$log_sounds <- log10(data$Sounds)
+
+# standaridised sounds
+data$standard_sounds <- scale(data$Sounds)
+
+# Create a ggplot with the world map
+phoneme_map <- ggplot() +
+  geom_polygon(data = map, aes(x = long, y = lat, group = group), fill = "white", color = "lightgrey") +
+  geom_point(data = data, aes(x = Longitude, y = Latitude, color = log_sounds), size = 0.8) +
+  #scale_color_gradient(low = "blue", high = "red") +
+  scale_color_viridis(option = "viridis", direction = -1)
+  theme_minimal()
+
+# Save graph
+ggsave(plot = phoneme_map, filename = gsub(" ", "", paste("Output/PhonemeMap/", database, "_PhonemeMap.pdf")), scale = 0.3)
+
+# Show graph
+phoneme_map
+```
+
+Heat map of points - Not working right now
+
+```{r}
+ggplot(map) +
+  geom_tile(data = data, aes(x = Longitude, y = Latitude, fill = Sounds),
+            stat = "sum", binwidth = c(10, 10)) +
+  scale_fill_viridis(name = "Total Sounds", trans = "log1p") +
+  theme_minimal()
+```
+
